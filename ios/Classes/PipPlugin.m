@@ -1,6 +1,8 @@
 #import "PipPlugin.h"
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
+#import <WebRTC/RTCYUVHelper.h>
+#import <WebRTC/RTCYUVPlanarBuffer.h>
 
 @interface NSObject (FlutterWebRTCBridge)
 + (id)sharedSingleton;
@@ -47,15 +49,55 @@
   if (!frame) return;
 
   CVPixelBufferRef pixelBuffer = NULL;
+  BOOL ownsPixelBuffer = NO;
   if ([frame.buffer isKindOfClass:NSClassFromString(@"RTCCVPixelBuffer")]) {
     pixelBuffer = ((RTCCVPixelBuffer *)frame.buffer).pixelBuffer;
+  } else {
+    id<RTCI420Buffer> i420 = [frame.buffer toI420];
+    if (!i420) return;
+
+    CVReturn result = CVPixelBufferCreate(
+        kCFAllocatorDefault, i420.width, i420.height,
+        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, NULL, &pixelBuffer);
+    if (result != kCVReturnSuccess || !pixelBuffer) return;
+
+    if (CVPixelBufferLockBaseAddress(pixelBuffer, 0) != kCVReturnSuccess) {
+      CVPixelBufferRelease(pixelBuffer);
+      return;
+    }
+
+    uint8_t *dstY = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0);
+    uint8_t *dstUV = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1);
+    if (dstY && dstUV) {
+      [RTCYUVHelper I420ToNV12:i420.dataY
+                   srcStrideY:i420.strideY
+                         srcU:i420.dataU
+                   srcStrideU:i420.strideU
+                         srcV:i420.dataV
+                   srcStrideV:i420.strideV
+                         dstY:dstY
+                   dstStrideY:(int)CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
+                        dstUV:dstUV
+                  dstStrideUV:(int)CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1)
+                        width:i420.width
+                       height:i420.height];
+    }
+    result = CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
+    if (!dstY || !dstUV || result != kCVReturnSuccess) {
+      CVPixelBufferRelease(pixelBuffer);
+      return;
+    }
+    ownsPixelBuffer = YES;
   }
   if (!pixelBuffer) return;
 
   CMVideoFormatDescriptionRef formatDesc = NULL;
   OSStatus status = CMVideoFormatDescriptionCreateForImageBuffer(
       kCFAllocatorDefault, pixelBuffer, &formatDesc);
-  if (status != noErr || !formatDesc) return;
+  if (status != noErr || !formatDesc) {
+    if (ownsPixelBuffer) CVPixelBufferRelease(pixelBuffer);
+    return;
+  }
 
   CMSampleTimingInfo timing;
   timing.duration = kCMTimeInvalid;
@@ -67,6 +109,7 @@
   status = CMSampleBufferCreateForImageBuffer(
       kCFAllocatorDefault, pixelBuffer, true, NULL, NULL,
       formatDesc, &timing, &sampleBuffer);
+  if (ownsPixelBuffer) CVPixelBufferRelease(pixelBuffer);
   CFRelease(formatDesc);
   if (status != noErr || !sampleBuffer) return;
 
