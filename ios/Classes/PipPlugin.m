@@ -159,6 +159,14 @@
     return;
   }
 
+  CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, true);
+  if (attachments && CFArrayGetCount(attachments) > 0) {
+    CFMutableDictionaryRef sampleAttachments =
+        (CFMutableDictionaryRef)CFArrayGetValueAtIndex(attachments, 0);
+    CFDictionarySetValue(sampleAttachments, kCMSampleAttachmentKey_DisplayImmediately,
+                         kCFBooleanTrue);
+  }
+
   AVSampleBufferDisplayLayer *layer = self.displayLayer;
   if (!layer) {
     [self reportStage:@"displayLayer" detail:@"Display layer unavailable"];
