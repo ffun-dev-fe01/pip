@@ -18,6 +18,12 @@ class MethodChannelPip extends PipPlatform {
   }
 
   Future<void> _handleMethod(MethodCall call) async {
+    if (call.method == 'diagnostic') {
+      final arguments = call.arguments as Map;
+      debugPrint('[PipDiagnostics] ${arguments['stage']}: ${arguments['detail']}');
+      return;
+    }
+
     try {
       if (call.method == 'stateChanged') {
         final jsonMap = Map<String, dynamic>.from(call.arguments as Map);

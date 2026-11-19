@@ -33,9 +33,14 @@
 @property(nonatomic, weak) AVSampleBufferDisplayLayer *displayLayer;
 @property(nonatomic, weak) PipCompositeView *compositeView;
 @property(nonatomic, assign) RTCVideoRotation lastRotation;
+@property(nonatomic, strong) FlutterMethodChannel *diagnosticChannel;
+- (void)setDiagnosticsActive:(BOOL)active;
+- (void)reportStage:(NSString *)stage detail:(NSString *)detail;
 @end
 
-@implementation PipSampleBufferRenderer
+@implementation PipSampleBufferRenderer {
+  NSMutableDictionary<NSString *, NSString *> *_sessionDiagnostics;
+}
 - (instancetype)initWithDisplayLayer:(AVSampleBufferDisplayLayer *)layer {
   self = [super init];
   if (self) {
@@ -45,8 +50,31 @@
   return self;
 }
 - (void)setSize:(CGSize)size {}
+- (void)setDiagnosticsActive:(BOOL)active {
+  @synchronized (self) {
+    _sessionDiagnostics = active ? [NSMutableDictionary dictionary] : nil;
+  }
+}
+
+- (void)reportStage:(NSString *)stage detail:(NSString *)detail {
+  NSMutableDictionary *session;
+  @synchronized (self) {
+    session = _sessionDiagnostics;
+    if (!session || [session[stage] isEqualToString:detail]) return;
+    session[stage] = detail;
+  }
+  dispatch_async(dispatch_get_main_queue(), ^{
+    @synchronized (self) {
+      if (self->_sessionDiagnostics != session) return;
+    }
+    [self.diagnosticChannel invokeMethod:@"diagnostic"
+                               arguments:@{@"stage": stage, @"detail": detail}];
+  });
+}
+
 - (void)renderFrame:(nullable RTCVideoFrame *)frame {
   if (!frame) return;
+  [self reportStage:@"frame" detail:@"First frame received"];
 
   CVPixelBufferRef pixelBuffer = NULL;
   BOOL ownsPixelBuffer = NO;
@@ -54,14 +82,22 @@
     pixelBuffer = ((RTCCVPixelBuffer *)frame.buffer).pixelBuffer;
   } else {
     id<RTCI420Buffer> i420 = [frame.buffer toI420];
-    if (!i420) return;
+    if (!i420) {
+      [self reportStage:@"i420" detail:@"toI420 returned nil"];
+      return;
+    }
 
     CVReturn result = CVPixelBufferCreate(
         kCFAllocatorDefault, i420.width, i420.height,
         kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, NULL, &pixelBuffer);
-    if (result != kCVReturnSuccess || !pixelBuffer) return;
+    if (result != kCVReturnSuccess || !pixelBuffer) {
+      [self reportStage:@"pixelBufferCreate" detail:@(result).stringValue];
+      return;
+    }
 
-    if (CVPixelBufferLockBaseAddress(pixelBuffer, 0) != kCVReturnSuccess) {
+    result = CVPixelBufferLockBaseAddress(pixelBuffer, 0);
+    if (result != kCVReturnSuccess) {
+      [self reportStage:@"pixelBufferLock" detail:@(result).stringValue];
       CVPixelBufferRelease(pixelBuffer);
       return;
     }
@@ -84,17 +120,24 @@
     }
     result = CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
     if (!dstY || !dstUV || result != kCVReturnSuccess) {
+      [self reportStage:@"pixelBufferWrite"
+                 detail:[NSString stringWithFormat:@"planes available=%d, unlock=%d",
+                                                    dstY && dstUV, result]];
       CVPixelBufferRelease(pixelBuffer);
       return;
     }
     ownsPixelBuffer = YES;
   }
-  if (!pixelBuffer) return;
+  if (!pixelBuffer) {
+    [self reportStage:@"pixelBuffer" detail:@"WebRTC pixel buffer unavailable"];
+    return;
+  }
 
   CMVideoFormatDescriptionRef formatDesc = NULL;
   OSStatus status = CMVideoFormatDescriptionCreateForImageBuffer(
       kCFAllocatorDefault, pixelBuffer, &formatDesc);
   if (status != noErr || !formatDesc) {
+    [self reportStage:@"formatDescription" detail:@(status).stringValue];
     if (ownsPixelBuffer) CVPixelBufferRelease(pixelBuffer);
     return;
   }
@@ -111,10 +154,14 @@
       formatDesc, &timing, &sampleBuffer);
   if (ownsPixelBuffer) CVPixelBufferRelease(pixelBuffer);
   CFRelease(formatDesc);
-  if (status != noErr || !sampleBuffer) return;
+  if (status != noErr || !sampleBuffer) {
+    [self reportStage:@"sampleBuffer" detail:@(status).stringValue];
+    return;
+  }
 
   AVSampleBufferDisplayLayer *layer = self.displayLayer;
   if (!layer) {
+    [self reportStage:@"displayLayer" detail:@"Display layer unavailable"];
     CFRelease(sampleBuffer);
     return;
   }
@@ -128,9 +175,17 @@
 
   dispatch_async(dispatch_get_main_queue(), ^{
     if (layer.status == AVQueuedSampleBufferRenderingStatusFailed) {
+      [self reportStage:@"layerError"
+                 detail:layer.error.description ?: @"Display layer failed without an error"];
       [layer flush];
     }
     [layer enqueueSampleBuffer:sampleBuffer];
+    [self reportStage:@"enqueue" detail:@"First sample buffer enqueued"];
+    if (@available(iOS 17.4, *)) {
+      if (layer.readyForDisplay) {
+        [self reportStage:@"readyForDisplay" detail:@"Display layer has an image"];
+      }
+    }
     CFRelease(sampleBuffer);
 
     if (rotationChanged && composite) {
@@ -363,6 +418,7 @@
         [[PipSampleBufferRenderer alloc]
             initWithDisplayLayer:remoteView.sampleBufferLayer];
     renderer.compositeView = composite;
+    renderer.diagnosticChannel = self.channel;
     [videoTrack addRenderer:renderer];
 
     RTCCameraVideoCapturer *capturer =
@@ -427,6 +483,15 @@
 }
 
 - (void)pipStateChanged:(PipState)state error:(NSString *)error {
+  PipSampleBufferRenderer *renderer = self.pipVideoRenderer;
+  [renderer setDiagnosticsActive:state == PipStateStarted];
+  if (state == PipStateStarted && renderer) {
+    UIView *view = self.nativePipVideoView;
+    [renderer reportStage:@"layout"
+                   detail:[NSString stringWithFormat:@"content frame=%@, parent bounds=%@",
+                       NSStringFromCGRect(view.frame),
+                       NSStringFromCGRect(view.superview.bounds)]];
+  }
   NSDictionary *arguments = [[NSDictionary alloc]
       initWithObjectsAndKeys:[NSNumber numberWithLong:(long)state], @"state",
                              error, @"error", nil];

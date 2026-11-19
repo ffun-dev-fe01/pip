@@ -366,7 +366,7 @@
   _contentView.translatesAutoresizingMaskIntoConstraints = YES;
   _contentView.autoresizingMask =
       UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-  _contentView.frame = newParentView.frame;
+  _contentView.frame = newParentView.bounds;
 
   // It seems like no need to do so.
   // [newParentView addConstraints:@[
